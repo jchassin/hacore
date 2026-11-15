@@ -1,6 +1,8 @@
 """Fixtures for the Openhome integration tests."""
 
+import base64
 from collections.abc import Generator
+import struct
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from openhomedevice.device import Device
@@ -11,6 +13,17 @@ from homeassistant.components.openhome.const import DOMAIN
 from homeassistant.const import CONF_HOST, Platform
 
 HOST = "http://localhost"
+
+# Playlist service action results: track id 2 is current, ids 1-2-3 are in the
+# playlist and a new Insert gets id 4.
+PLAYLIST_ACTION_RESULTS = {
+    "Id": {"Value": 2},
+    "IdArray": {
+        "Array": base64.b64encode(struct.pack(">3I", 1, 2, 3)).decode("ascii"),
+        "Token": 1,
+    },
+    "Insert": {"NewId": 4},
+}
 
 TRACK_INFO = {
     "albumArtwork": "http://localhost/album.jpg",
@@ -86,6 +99,22 @@ def mock_device_class() -> Generator[MagicMock]:
         device.update_firmware = AsyncMock()
         for method in ACTION_METHODS:
             setattr(device, method.__name__, AsyncMock())
+        # The Playlist service actions the enqueue modes drive, one mock per
+        # action name, kept on the device so tests can assert on each call.
+        playlist_actions: dict[str, MagicMock] = {}
+
+        def playlist_action(name: str) -> MagicMock:
+            if name not in playlist_actions:
+                action = MagicMock()
+                action.async_call = AsyncMock(
+                    return_value=PLAYLIST_ACTION_RESULTS.get(name, {})
+                )
+                playlist_actions[name] = action
+            return playlist_actions[name]
+
+        device.playlist_service = MagicMock()
+        device.playlist_service.action = MagicMock(side_effect=playlist_action)
+        device.playlist_actions = playlist_actions
         yield mock_class
 
 

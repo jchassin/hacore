@@ -4,6 +4,8 @@ from collections.abc import Callable, Generator
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from async_upnp_client.exceptions import UpnpError
+from openhomedevice import didl_lite
 from openhomedevice.device import Device
 from openhomedevice.exceptions import OpenhomeConnectionError
 import pytest
@@ -14,11 +16,14 @@ from homeassistant.components.media_player import (
     ATTR_INPUT_SOURCE,
     ATTR_MEDIA_CONTENT_ID,
     ATTR_MEDIA_CONTENT_TYPE,
+    ATTR_MEDIA_ENQUEUE,
     ATTR_MEDIA_VOLUME_LEVEL,
     ATTR_MEDIA_VOLUME_MUTED,
     DOMAIN as MEDIA_PLAYER_DOMAIN,
     SERVICE_PLAY_MEDIA,
     SERVICE_SELECT_SOURCE,
+    MediaPlayerEnqueue,
+    MediaPlayerEntityFeature,
     MediaType,
 )
 from homeassistant.components.openhome.const import (
@@ -56,6 +61,7 @@ from .conftest import TRACK_INFO
 
 ENTITY_ID = "media_player.friendly_name"
 MEDIA_ID = "http://localhost/track.flac"
+TRACK_METADATA = didl_lite.generate_string({"title": "Home Assistant", "uri": MEDIA_ID})
 
 # Each action, the coroutine it drives, a source type that exposes the supported
 # feature it is gated behind, and the arguments the device must be called with.
@@ -185,9 +191,50 @@ ACTIONS = [
             ATTR_MEDIA_CONTENT_ID: MEDIA_ID,
         },
         Device.play_media,
-        "Playlist",
+        "Radio",
         ({"title": "Home Assistant", "uri": MEDIA_ID},),
         id="play_media",
+    ),
+]
+
+# Each enqueue mode and the Playlist service actions it must drive: ADD appends
+# after the last track id, NEXT inserts after the current id and seeks to it,
+# PLAY appends and seeks to the new track, REPLACE clears the playlist first.
+ENQUEUE_PLAYLIST_CALLS = [
+    pytest.param(
+        MediaPlayerEnqueue.ADD,
+        {
+            "IdArray": {},
+            "Insert": {"AfterId": 3, "Uri": MEDIA_ID, "Metadata": TRACK_METADATA},
+        },
+        id="add",
+    ),
+    pytest.param(
+        MediaPlayerEnqueue.NEXT,
+        {
+            "Id": {},
+            "Insert": {"AfterId": 2, "Uri": MEDIA_ID, "Metadata": TRACK_METADATA},
+            "SeekId": {"Value": 4},
+        },
+        id="next",
+    ),
+    pytest.param(
+        MediaPlayerEnqueue.PLAY,
+        {
+            "IdArray": {},
+            "Insert": {"AfterId": 3, "Uri": MEDIA_ID, "Metadata": TRACK_METADATA},
+            "SeekId": {"Value": 4},
+        },
+        id="play",
+    ),
+    pytest.param(
+        MediaPlayerEnqueue.REPLACE,
+        {
+            "DeleteAll": {},
+            "Insert": {"AfterId": 0, "Uri": MEDIA_ID, "Metadata": TRACK_METADATA},
+            "SeekId": {"Value": 4},
+        },
+        id="replace",
     ),
 ]
 
@@ -281,6 +328,135 @@ async def test_action_error_is_raised(
     assert err.value.translation_domain == DOMAIN
     assert err.value.translation_key == service
     mocked.assert_awaited()
+
+
+@pytest.mark.parametrize(("enqueue", "expected_calls"), ENQUEUE_PLAYLIST_CALLS)
+async def test_play_media_enqueue_on_playlist(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+    enqueue: MediaPlayerEnqueue,
+    expected_calls: dict[str, dict[str, Any]],
+) -> None:
+    """Test each enqueue mode drives the expected Playlist service actions."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": "Playlist",
+        "type": "Playlist",
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        MEDIA_PLAYER_DOMAIN,
+        SERVICE_PLAY_MEDIA,
+        {
+            ATTR_ENTITY_ID: ENTITY_ID,
+            ATTR_MEDIA_CONTENT_TYPE: MediaType.MUSIC,
+            ATTR_MEDIA_CONTENT_ID: MEDIA_ID,
+            ATTR_MEDIA_ENQUEUE: enqueue,
+        },
+        blocking=True,
+    )
+
+    assert set(mock_device.playlist_actions) == set(expected_calls)
+    for name, kwargs in expected_calls.items():
+        mock_device.playlist_actions[name].async_call.assert_awaited_once_with(**kwargs)
+    mock_device.play_media.assert_not_awaited()
+
+
+async def test_play_media_enqueue_ignored_off_playlist(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test enqueue falls back to play_media when the source has no playlist."""
+    mock_device.source.return_value = {
+        "index": 1,
+        "name": "Radio",
+        "type": "Radio",
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        MEDIA_PLAYER_DOMAIN,
+        SERVICE_PLAY_MEDIA,
+        {
+            ATTR_ENTITY_ID: ENTITY_ID,
+            ATTR_MEDIA_CONTENT_TYPE: MediaType.MUSIC,
+            ATTR_MEDIA_CONTENT_ID: MEDIA_ID,
+            ATTR_MEDIA_ENQUEUE: MediaPlayerEnqueue.ADD,
+        },
+        blocking=True,
+    )
+
+    mock_device.play_media.assert_awaited_once_with(
+        {"title": "Home Assistant", "uri": MEDIA_ID}
+    )
+    assert not mock_device.playlist_actions
+
+
+async def test_play_media_enqueue_error_is_raised(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a rejected Playlist service action raises HomeAssistantError."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": "Playlist",
+        "type": "Playlist",
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    delete_all = mock_device.playlist_service.action("DeleteAll")
+    delete_all.async_call.side_effect = UpnpError("SOAP fault")
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: ENTITY_ID,
+                ATTR_MEDIA_CONTENT_TYPE: MediaType.MUSIC,
+                ATTR_MEDIA_CONTENT_ID: MEDIA_ID,
+                ATTR_MEDIA_ENQUEUE: MediaPlayerEnqueue.REPLACE,
+            },
+            blocking=True,
+        )
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == SERVICE_PLAY_MEDIA
+    delete_all.async_call.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize(
+    ("source_type", "expect_enqueue"),
+    [
+        pytest.param("Playlist", True, id="playlist_source"),
+        pytest.param("Radio", False, id="radio_source"),
+    ],
+)
+async def test_media_enqueue_feature(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+    source_type: str,
+    expect_enqueue: bool,
+) -> None:
+    """Test MEDIA_ENQUEUE is only advertised for playlist sources."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": source_type,
+        "type": source_type,
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    features = hass.states.get(ENTITY_ID).attributes["supported_features"]
+    assert bool(features & MediaPlayerEntityFeature.MEDIA_ENQUEUE) is expect_enqueue
 
 
 async def test_invoke_pin_calls_device(

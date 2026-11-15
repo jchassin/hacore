@@ -1,17 +1,23 @@
 """Support for Openhome Devices."""
 
+import base64
 from collections.abc import Awaitable, Callable, Coroutine
 import functools
 import logging
+import struct
 from typing import Any, Concatenate, override
 
+from async_upnp_client.exceptions import UpnpError
+from openhomedevice import didl_lite
 from openhomedevice.exceptions import OpenhomeError
 
 from homeassistant.components import media_source
 from homeassistant.components.media_player import (
+    ATTR_MEDIA_ENQUEUE,
     SERVICE_PLAY_MEDIA,
     SERVICE_SELECT_SOURCE,
     BrowseMedia,
+    MediaPlayerEnqueue,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
@@ -89,7 +95,7 @@ def catch_request_errors[_OpenhomeDeviceT: OpenhomeDevice, **_P, _R](
             """Catch OpenhomeError errors."""
             try:
                 return await func(self, *args, **kwargs)
-            except OpenhomeError as err:
+            except (OpenhomeError, UpnpError) as err:
                 raise HomeAssistantError(
                     translation_domain=DOMAIN,
                     translation_key=action,
@@ -171,6 +177,7 @@ class OpenhomeDevice(MediaPlayerEntity):
                     | MediaPlayerEntityFeature.PLAY
                     | MediaPlayerEntityFeature.PLAY_MEDIA
                     | MediaPlayerEntityFeature.BROWSE_MEDIA
+                    | MediaPlayerEntityFeature.MEDIA_ENQUEUE
                 )
 
             in_standby = await self._device.is_in_standby()
@@ -229,7 +236,60 @@ class OpenhomeDevice(MediaPlayerEntity):
         media_id = async_process_play_media_url(self.hass, media_id)
 
         track_details = {"title": "Home Assistant", "uri": media_id}
-        await self._device.play_media(track_details)
+        enqueue = kwargs.get(ATTR_MEDIA_ENQUEUE, MediaPlayerEnqueue.REPLACE)
+
+        source = await self._device.source()
+        if source["type"] in ("Playlist", "Spotify"):
+            await self._async_play_on_playlist(track_details, enqueue)
+        else:
+            await self._device.play_media(track_details)
+
+    async def _async_playlist_action(self, name: str, **kwargs: Any) -> dict[str, Any]:
+        """Call an action on the device Playlist service."""
+        action = self._device.playlist_service.action(name)
+        return await action.async_call(**kwargs)
+
+    async def _async_last_track_id(self) -> int:
+        """Return the id of the last track in the playlist, 0 when empty."""
+        result = await self._async_playlist_action("IdArray")
+        data = base64.b64decode(result.get("Array", ""))
+        if not data:
+            return 0
+        return struct.unpack(f">{len(data) // 4}I", data)[-1]
+
+    async def _async_insert_track(
+        self, track_details: dict[str, str], after_id: int
+    ) -> int:
+        """Insert a track in the playlist after after_id, returning its new id."""
+        result = await self._async_playlist_action(
+            "Insert",
+            AfterId=after_id,
+            Uri=track_details["uri"],
+            Metadata=didl_lite.generate_string(track_details),
+        )
+        return int(result["NewId"])
+
+    async def _async_play_on_playlist(
+        self, track_details: dict[str, str], enqueue: MediaPlayerEnqueue
+    ) -> None:
+        """Add the track to the device playlist according to the enqueue mode."""
+        if enqueue == MediaPlayerEnqueue.ADD:
+            await self._async_insert_track(
+                track_details, await self._async_last_track_id()
+            )
+        elif enqueue == MediaPlayerEnqueue.NEXT:
+            current_id = (await self._async_playlist_action("Id"))["Value"]
+            new_id = await self._async_insert_track(track_details, current_id)
+            await self._async_playlist_action("SeekId", Value=new_id)
+        elif enqueue == MediaPlayerEnqueue.PLAY:
+            new_id = await self._async_insert_track(
+                track_details, await self._async_last_track_id()
+            )
+            await self._async_playlist_action("SeekId", Value=new_id)
+        else:
+            await self._async_playlist_action("DeleteAll")
+            new_id = await self._async_insert_track(track_details, 0)
+            await self._async_playlist_action("SeekId", Value=new_id)
 
     @catch_request_errors(SERVICE_MEDIA_PAUSE)
     @override

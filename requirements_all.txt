@@ -614,6 +614,7 @@ asusrouter==1.21.3
 
 # homeassistant.components.dlna_dmr
 # homeassistant.components.dlna_dms
+# homeassistant.components.openhome
 # homeassistant.components.samsungtv
 # homeassistant.components.ssdp
 # homeassistant.components.upnp
