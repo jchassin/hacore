@@ -20,3 +20,18 @@ def async_setup_services(hass: HomeAssistant) -> None:
         schema={probatio.Required(OpenhomeServiceArgument.PIN): cv.positive_int},
         func="async_invoke_pin",
     )
+    service.async_register_platform_entity_service(
+        hass,
+        DOMAIN,
+        OpenhomeService.REMOVE_FROM_PLAYLIST,
+        entity_domain=MEDIA_PLAYER_DOMAIN,
+        schema={
+            probatio.Optional(OpenhomeServiceArgument.TRACK_ID): probatio.Any(
+                cv.positive_int, [cv.positive_int]
+            ),
+            probatio.Optional(OpenhomeServiceArgument.URI): probatio.Any(
+                cv.string, [cv.string]
+            ),
+        },
+        func="async_remove_from_playlist",
+    )

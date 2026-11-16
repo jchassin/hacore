@@ -4,7 +4,9 @@ import base64
 from collections.abc import Generator
 import struct
 from unittest.mock import AsyncMock, MagicMock, patch
+from xml.sax.saxutils import escape
 
+from openhomedevice import didl_lite
 from openhomedevice.device import Device
 import pytest
 from pytest_homeassistant.common import MockConfigEntry
@@ -14,15 +16,36 @@ from homeassistant.const import CONF_HOST, Platform
 
 HOST = "http://localhost"
 
-# Playlist service action results: track id 2 is current, ids 1-2-3 are in the
-# playlist and a new Insert gets id 4.
+# The tracks of the device playlist: id 2 is current, a new Insert gets id 4.
+PLAYLIST_TRACKS = {
+    track_id: {
+        "title": f"Track {track_id}",
+        "uri": f"http://localhost/track{track_id}.flac",
+    }
+    for track_id in (1, 2, 3)
+}
+
+TRACK_LIST_XML = (
+    "<TrackList>"
+    + "".join(
+        f"<Entry><Id>{track_id}</Id><Uri>{details['uri']}</Uri>"
+        f"<Metadata>{escape(didl_lite.generate_string(details))}</Metadata></Entry>"
+        for track_id, details in PLAYLIST_TRACKS.items()
+    )
+    + "</TrackList>"
+)
+
+# Playlist service action results.
 PLAYLIST_ACTION_RESULTS = {
     "Id": {"Value": 2},
     "IdArray": {
-        "Array": base64.b64encode(struct.pack(">3I", 1, 2, 3)).decode("ascii"),
+        "Array": base64.b64encode(
+            struct.pack(f">{len(PLAYLIST_TRACKS)}I", *PLAYLIST_TRACKS)
+        ).decode("ascii"),
         "Token": 1,
     },
     "Insert": {"NewId": 4},
+    "ReadList": {"TrackList": TRACK_LIST_XML},
 }
 
 TRACK_INFO = {
