@@ -100,10 +100,10 @@ def catch_request_errors[_OpenhomeDeviceT: OpenhomeDevice, **_P, _R](
         async def wrapper(
             self: _OpenhomeDeviceT, *args: _P.args, **kwargs: _P.kwargs
         ) -> _R:
-            """Catch OpenhomeError errors."""
+            """Catch device errors, including raw network OSErrors."""
             try:
                 return await func(self, *args, **kwargs)
-            except (OpenhomeError, UpnpError) as err:
+            except (OpenhomeError, UpnpError, OSError) as err:
                 raise HomeAssistantError(
                     translation_domain=DOMAIN,
                     translation_key=action,
@@ -204,7 +204,7 @@ class OpenhomeDevice(MediaPlayerEntity):
                 self._attr_state = MediaPlayerState.PLAYING
 
             self._attr_available = True
-        except OpenhomeError as err:
+        except (OpenhomeError, OSError) as err:
             if self._attr_available:
                 _LOGGER.warning("Error updating %s: %s", self.entity_id, err)
             self._attr_available = False
@@ -475,7 +475,7 @@ class OpenhomeDevice(MediaPlayerEntity):
         try:
             ids = await self._async_playlist_ids()
             tracks = await self._async_playlist_tracks(ids)
-        except (OpenhomeError, UpnpError) as err:
+        except (OpenhomeError, UpnpError, OSError) as err:
             raise BrowseError(
                 translation_domain=DOMAIN,
                 translation_key="browse_playlist_failed",

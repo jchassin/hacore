@@ -437,6 +437,39 @@ async def test_play_media_enqueue_error_is_raised(
     delete_all.async_call.assert_awaited_once_with()
 
 
+async def test_play_media_timeout_is_raised(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a raw TimeoutError from the device raises a translated HomeAssistantError."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": "Playlist",
+        "type": "Playlist",
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    id_array = mock_device.playlist_service.action("IdArray")
+    id_array.async_call.side_effect = TimeoutError("[Errno 110] Connection timed out")
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: ENTITY_ID,
+                ATTR_MEDIA_CONTENT_TYPE: MediaType.MUSIC,
+                ATTR_MEDIA_CONTENT_ID: MEDIA_ID,
+            },
+            blocking=True,
+        )
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == SERVICE_PLAY_MEDIA
+
+
 async def test_play_media_without_enqueue_appends_to_playlist(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
@@ -835,28 +868,45 @@ async def test_media_player(
     await snapshot_platform(hass, entity_registry, snapshot, mock_config_entry.entry_id)
 
 
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        pytest.param(
+            OpenhomeConnectionError("device unreachable"),
+            "device unreachable",
+            id="openhome_error",
+        ),
+        pytest.param(
+            TimeoutError("[Errno 110] Connection timed out"),
+            "[Errno 110] Connection timed out",
+            id="timeout_error",
+        ),
+    ],
+)
 async def test_becomes_unavailable_and_recovers(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_device: MagicMock,
     caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    message: str,
 ) -> None:
     """Test a failed poll logs once, marks the device unavailable and recovers."""
     await setup_media_player(hass, mock_config_entry)
 
     assert hass.states.get(ENTITY_ID).state == STATE_PLAYING
 
-    mock_device.room.side_effect = OpenhomeConnectionError("device unreachable")
+    mock_device.room.side_effect = error
     await async_poll(hass)
 
     assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
-    assert caplog.text.count("device unreachable") == 1
+    assert caplog.text.count(message) == 1
 
     # A second consecutive failure must not log the same outage again.
     await async_poll(hass)
 
     assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
-    assert caplog.text.count("device unreachable") == 1
+    assert caplog.text.count(message) == 1
 
     mock_device.room.side_effect = None
     await async_poll(hass)
