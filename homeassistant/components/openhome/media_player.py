@@ -28,6 +28,7 @@ from homeassistant.components.media_player import (
     MediaType,
     async_process_play_media_url,
 )
+from homeassistant.components.media_source import MediaSourceItem
 from homeassistant.const import (
     SERVICE_MEDIA_NEXT_TRACK,
     SERVICE_MEDIA_PAUSE,
@@ -233,24 +234,42 @@ class OpenhomeDevice(MediaPlayerEntity):
             await self._async_play_playlist_media(media_id)
             return
 
+        # Radio streams carry their mime type as media_content_type; they are
+        # played through the Openhome Radio service, not added to the playlist.
+        is_radio = media_type.startswith("audio/")
+        track_details = {"title": "Home Assistant", "uri": media_id}
+
         if media_source.is_media_source_id(media_id):
+            source_item = MediaSourceItem.from_uri(self.hass, media_id, self.entity_id)
+            is_radio = source_item.domain == "radio_browser"
             media_type = MediaType.MUSIC
+            browsed = await media_source.async_browse_media(self.hass, media_id)
             play_item = await media_source.async_resolve_media(
                 self.hass, media_id, self.entity_id
             )
             media_id = play_item.url
+            # Store the media's own metadata in the playlist, not a generic one.
+            track_details = {
+                "title": browsed.title or "Home Assistant",
+                "uri": media_id,
+                "albumArtwork": browsed.thumbnail or "",
+            }
 
-        if media_type != MediaType.MUSIC:
+        if media_type != MediaType.MUSIC and not is_radio:
             _LOGGER.error(
-                "Invalid media type %s. Only %s is supported",
+                "Invalid media type %s. Only %s and audio streams are supported",
                 media_type,
                 MediaType.MUSIC,
             )
             return
 
         media_id = async_process_play_media_url(self.hass, media_id)
+        track_details["uri"] = media_id
 
-        track_details = {"title": "Home Assistant", "uri": media_id}
+        if is_radio:
+            await self._device.play_media(track_details)
+            return
+
         # Without an explicit enqueue, playing media appends it to the device
         # playlist and plays it there instead of streaming it directly.
         enqueue = kwargs.get(ATTR_MEDIA_ENQUEUE, MediaPlayerEnqueue.PLAY)

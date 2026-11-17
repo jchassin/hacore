@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Generator
 from typing import Any
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from async_upnp_client.exceptions import UpnpError
 from openhomedevice import didl_lite
@@ -29,6 +29,7 @@ from homeassistant.components.media_player import (
     MediaPlayerEntityFeature,
     MediaType,
 )
+from homeassistant.components.media_source import PlayMedia
 from homeassistant.components.openhome.const import (
     DOMAIN,
     OpenhomeService,
@@ -468,6 +469,126 @@ async def test_play_media_timeout_is_raised(
 
     assert err.value.translation_domain == DOMAIN
     assert err.value.translation_key == SERVICE_PLAY_MEDIA
+
+
+async def test_play_media_media_source_keeps_media_metadata(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a media library item is enqueued with its own title and artwork."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": "Playlist",
+        "type": "Playlist",
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    browsed = MagicMock(title="Track Title", thumbnail="http://localhost/art.jpg")
+    with (
+        patch(
+            "homeassistant.components.media_source.async_browse_media",
+            AsyncMock(return_value=browsed),
+        ),
+        patch(
+            "homeassistant.components.media_source.async_resolve_media",
+            AsyncMock(
+                return_value=PlayMedia(
+                    "http://localhost/media/track.flac", "audio/flac"
+                )
+            ),
+        ),
+    ):
+        await hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: ENTITY_ID,
+                ATTR_MEDIA_CONTENT_TYPE: MediaType.MUSIC,
+                ATTR_MEDIA_CONTENT_ID: "media-source://media_source/music/track.flac",
+            },
+            blocking=True,
+        )
+
+    expected_metadata = didl_lite.generate_string(
+        {
+            "title": "Track Title",
+            "uri": "http://localhost/media/track.flac",
+            "albumArtwork": "http://localhost/art.jpg",
+        }
+    )
+    mock_device.playlist_actions["Insert"].async_call.assert_awaited_once_with(
+        AfterId=3, Uri="http://localhost/media/track.flac", Metadata=expected_metadata
+    )
+    mock_device.play_media.assert_not_awaited()
+
+
+async def test_play_media_radio_browser_uses_radio_service(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a radio browser station is played through the Openhome Radio service."""
+    await setup_media_player(hass, mock_config_entry)
+
+    browsed = MagicMock(title="My Radio", thumbnail="http://localhost/favicon.ico")
+    with (
+        patch(
+            "homeassistant.components.media_source.async_browse_media",
+            AsyncMock(return_value=browsed),
+        ),
+        patch(
+            "homeassistant.components.media_source.async_resolve_media",
+            AsyncMock(
+                return_value=PlayMedia("http://stream.example/radio", "audio/mpeg")
+            ),
+        ),
+    ):
+        await hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: ENTITY_ID,
+                ATTR_MEDIA_CONTENT_TYPE: "audio/mpeg",
+                ATTR_MEDIA_CONTENT_ID: "media-source://radio_browser/station-uuid",
+            },
+            blocking=True,
+        )
+
+    mock_device.play_media.assert_awaited_once_with(
+        {
+            "title": "My Radio",
+            "uri": "http://stream.example/radio",
+            "albumArtwork": "http://localhost/favicon.ico",
+        }
+    )
+    assert not mock_device.playlist_actions
+
+
+async def test_play_media_raw_stream_uses_radio_service(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a raw audio stream URL is played through the Openhome Radio service."""
+    await setup_media_player(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        MEDIA_PLAYER_DOMAIN,
+        SERVICE_PLAY_MEDIA,
+        {
+            ATTR_ENTITY_ID: ENTITY_ID,
+            ATTR_MEDIA_CONTENT_TYPE: "audio/mpeg",
+            ATTR_MEDIA_CONTENT_ID: "http://stream.example/radio",
+        },
+        blocking=True,
+    )
+
+    mock_device.play_media.assert_awaited_once_with(
+        {"title": "Home Assistant", "uri": "http://stream.example/radio"}
+    )
+    assert not mock_device.playlist_actions
 
 
 async def test_play_media_without_enqueue_appends_to_playlist(
