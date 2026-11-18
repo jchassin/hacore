@@ -243,17 +243,20 @@ class OpenhomeDevice(MediaPlayerEntity):
             source_item = MediaSourceItem.from_uri(self.hass, media_id, self.entity_id)
             is_radio = source_item.domain == "radio_browser"
             media_type = MediaType.MUSIC
-            browsed = await media_source.async_browse_media(self.hass, media_id)
+            browsed = await self._async_browse_media_item(media_id)
             play_item = await media_source.async_resolve_media(
                 self.hass, media_id, self.entity_id
             )
             media_id = play_item.url
-            # Store the media's own metadata in the playlist, not a generic one.
+            # Keep the media's own metadata instead of a generic one.
             track_details = {
-                "title": browsed.title or "Home Assistant",
+                "title": "Home Assistant",
                 "uri": media_id,
-                "albumArtwork": browsed.thumbnail or "",
+                "albumArtwork": "",
             }
+            if browsed is not None:
+                track_details["title"] = browsed.title or "Home Assistant"
+                track_details["albumArtwork"] = browsed.thumbnail or ""
 
         if media_type != MediaType.MUSIC and not is_radio:
             _LOGGER.error(
@@ -323,6 +326,46 @@ class OpenhomeDevice(MediaPlayerEntity):
             return
         track_id = media_content_id.removeprefix(f"{PLAYLIST_MEDIA_CONTENT_ID}/")
         await self._async_playlist_action("SeekId", Value=int(track_id))
+
+    async def _async_browse_media_item(
+        self, media_content_id: str
+    ) -> BrowseMedia | None:
+        """Return the browse item for a media_content_id.
+
+        Browsing a leaf id can return a listing instead of the item (e.g.
+        radio_browser returns an empty listing for a station id), so fall back
+        to searching the media source root.
+        """
+        item = await media_source.async_browse_media(self.hass, media_content_id)
+        if not item.can_expand:
+            return item
+        parsed = MediaSourceItem.from_uri(self.hass, media_content_id, None)
+        if parsed.domain is None:
+            return None
+        root = await media_source.async_browse_media(
+            self.hass, f"{media_source.URI_SCHEME}{parsed.domain}"
+        )
+        return await self._async_search_media_tree(root, media_content_id, depth=0)
+
+    async def _async_search_media_tree(
+        self, item: BrowseMedia, media_content_id: str, *, depth: int
+    ) -> BrowseMedia | None:
+        """Search the children of an expandable browse item for a media_content_id."""
+        if depth > 2:
+            return None
+        for child in item.children or []:
+            if child.media_content_id == media_content_id:
+                return child
+            if child.can_expand:
+                sub_item = await media_source.async_browse_media(
+                    self.hass, child.media_content_id
+                )
+                found = await self._async_search_media_tree(
+                    sub_item, media_content_id, depth=depth + 1
+                )
+                if found is not None:
+                    return found
+        return None
 
     async def _async_insert_track(
         self, track_details: dict[str, str], after_id: int

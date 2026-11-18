@@ -485,7 +485,9 @@ async def test_play_media_media_source_keeps_media_metadata(
 
     await setup_media_player(hass, mock_config_entry)
 
-    browsed = MagicMock(title="Track Title", thumbnail="http://localhost/art.jpg")
+    browsed = MagicMock(
+        title="Track Title", thumbnail="http://localhost/art.jpg", can_expand=False
+    )
     with (
         patch(
             "homeassistant.components.media_source.async_browse_media",
@@ -532,7 +534,11 @@ async def test_play_media_radio_browser_uses_radio_service(
     """Test a radio browser station is played through the Openhome Radio service."""
     await setup_media_player(hass, mock_config_entry)
 
-    browsed = MagicMock(title="My Radio", thumbnail="http://localhost/favicon.ico")
+    browsed = MagicMock(
+        title="My Radio",
+        thumbnail="http://localhost/favicon.ico",
+        can_expand=False,
+    )
     with (
         patch(
             "homeassistant.components.media_source.async_browse_media",
@@ -561,6 +567,73 @@ async def test_play_media_radio_browser_uses_radio_service(
             "title": "My Radio",
             "uri": "http://stream.example/radio",
             "albumArtwork": "http://localhost/favicon.ico",
+        }
+    )
+    assert not mock_device.playlist_actions
+
+
+async def test_play_media_radio_station_found_in_source_listing(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a station browsed as a listing gets its name and icon in the metadata."""
+    await setup_media_player(hass, mock_config_entry)
+
+    station_id = "media-source://radio_browser/station-uuid"
+    station = MagicMock(
+        media_content_id=station_id,
+        title="France Inter",
+        thumbnail="http://localhost/france-inter.ico",
+        can_play=True,
+        can_expand=False,
+    )
+    category = MagicMock(
+        media_content_id="media-source://radio_browser/popular", can_expand=True
+    )
+    category_listing = MagicMock(can_expand=True, children=[station])
+    root_listing = MagicMock(can_expand=True, children=[category])
+
+    async def browse_side_effect(
+        hass: HomeAssistant, media_content_id: str, **kwargs: Any
+    ) -> MagicMock:
+        if media_content_id == category.media_content_id:
+            return category_listing
+        if media_content_id == station_id:
+            # radio_browser returns an empty listing for a station id
+            return MagicMock(can_expand=True, children=[])
+        return root_listing
+
+    with (
+        patch(
+            "homeassistant.components.media_source.async_browse_media",
+            AsyncMock(side_effect=browse_side_effect),
+        ),
+        patch(
+            "homeassistant.components.media_source.async_resolve_media",
+            AsyncMock(
+                return_value=PlayMedia(
+                    "http://stream.example/france-inter", "audio/mpeg"
+                )
+            ),
+        ),
+    ):
+        await hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: ENTITY_ID,
+                ATTR_MEDIA_CONTENT_TYPE: "audio/mpeg",
+                ATTR_MEDIA_CONTENT_ID: station_id,
+            },
+            blocking=True,
+        )
+
+    mock_device.play_media.assert_awaited_once_with(
+        {
+            "title": "France Inter",
+            "uri": "http://stream.example/france-inter",
+            "albumArtwork": "http://localhost/france-inter.ico",
         }
     )
     assert not mock_device.playlist_actions
