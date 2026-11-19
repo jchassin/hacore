@@ -2,8 +2,10 @@
 
 from collections.abc import Callable, Generator
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
+from async_upnp_client.exceptions import UpnpError
+from openhomedevice import didl_lite
 from openhomedevice.device import Device
 from openhomedevice.exceptions import OpenhomeConnectionError
 import pytest
@@ -14,18 +16,26 @@ from homeassistant.components.media_player import (
     ATTR_INPUT_SOURCE,
     ATTR_MEDIA_CONTENT_ID,
     ATTR_MEDIA_CONTENT_TYPE,
+    ATTR_MEDIA_ENQUEUE,
     ATTR_MEDIA_VOLUME_LEVEL,
     ATTR_MEDIA_VOLUME_MUTED,
     DOMAIN as MEDIA_PLAYER_DOMAIN,
+    SERVICE_CLEAR_PLAYLIST,
     SERVICE_PLAY_MEDIA,
     SERVICE_SELECT_SOURCE,
+    BrowseError,
+    MediaClass,
+    MediaPlayerEnqueue,
+    MediaPlayerEntityFeature,
     MediaType,
 )
+from homeassistant.components.media_source import PlayMedia
 from homeassistant.components.openhome.const import (
     DOMAIN,
     OpenhomeService,
     OpenhomeServiceArgument,
 )
+from homeassistant.components.openhome.media_player import PLAYLIST_MEDIA_CONTENT_ID
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     SERVICE_MEDIA_NEXT_TRACK,
@@ -48,14 +58,16 @@ from homeassistant.const import (
     Platform,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.setup import async_setup_component
 
 from . import async_poll, setup_integration
 from .conftest import TRACK_INFO
 
 ENTITY_ID = "media_player.friendly_name"
 MEDIA_ID = "http://localhost/track.flac"
+TRACK_METADATA = didl_lite.generate_string({"title": "Home Assistant", "uri": MEDIA_ID})
 
 # Each action, the coroutine it drives, a source type that exposes the supported
 # feature it is gated behind, and the arguments the device must be called with.
@@ -185,9 +197,50 @@ ACTIONS = [
             ATTR_MEDIA_CONTENT_ID: MEDIA_ID,
         },
         Device.play_media,
-        "Playlist",
+        "Radio",
         ({"title": "Home Assistant", "uri": MEDIA_ID},),
         id="play_media",
+    ),
+]
+
+# Each enqueue mode and the Playlist service actions it must drive: ADD appends
+# after the last track id, NEXT inserts after the current id and seeks to it,
+# PLAY appends and seeks to the new track, REPLACE clears the playlist first.
+ENQUEUE_PLAYLIST_CALLS = [
+    pytest.param(
+        MediaPlayerEnqueue.ADD,
+        {
+            "IdArray": {},
+            "Insert": {"AfterId": 3, "Uri": MEDIA_ID, "Metadata": TRACK_METADATA},
+        },
+        id="add",
+    ),
+    pytest.param(
+        MediaPlayerEnqueue.NEXT,
+        {
+            "Id": {},
+            "Insert": {"AfterId": 2, "Uri": MEDIA_ID, "Metadata": TRACK_METADATA},
+            "SeekId": {"Value": 4},
+        },
+        id="next",
+    ),
+    pytest.param(
+        MediaPlayerEnqueue.PLAY,
+        {
+            "IdArray": {},
+            "Insert": {"AfterId": 3, "Uri": MEDIA_ID, "Metadata": TRACK_METADATA},
+            "SeekId": {"Value": 4},
+        },
+        id="play",
+    ),
+    pytest.param(
+        MediaPlayerEnqueue.REPLACE,
+        {
+            "DeleteAll": {},
+            "Insert": {"AfterId": 0, "Uri": MEDIA_ID, "Metadata": TRACK_METADATA},
+            "SeekId": {"Value": 4},
+        },
+        id="replace",
     ),
 ]
 
@@ -283,6 +336,699 @@ async def test_action_error_is_raised(
     mocked.assert_awaited()
 
 
+@pytest.mark.parametrize(("enqueue", "expected_calls"), ENQUEUE_PLAYLIST_CALLS)
+async def test_play_media_enqueue_on_playlist(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+    enqueue: MediaPlayerEnqueue,
+    expected_calls: dict[str, dict[str, Any]],
+) -> None:
+    """Test each enqueue mode drives the expected Playlist service actions."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": "Playlist",
+        "type": "Playlist",
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        MEDIA_PLAYER_DOMAIN,
+        SERVICE_PLAY_MEDIA,
+        {
+            ATTR_ENTITY_ID: ENTITY_ID,
+            ATTR_MEDIA_CONTENT_TYPE: MediaType.MUSIC,
+            ATTR_MEDIA_CONTENT_ID: MEDIA_ID,
+            ATTR_MEDIA_ENQUEUE: enqueue,
+        },
+        blocking=True,
+    )
+
+    assert set(mock_device.playlist_actions) == set(expected_calls)
+    for name, kwargs in expected_calls.items():
+        mock_device.playlist_actions[name].async_call.assert_awaited_once_with(**kwargs)
+    mock_device.play_media.assert_not_awaited()
+
+
+async def test_play_media_enqueue_ignored_off_playlist(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test enqueue falls back to play_media when the source has no playlist."""
+    mock_device.source.return_value = {
+        "index": 1,
+        "name": "Radio",
+        "type": "Radio",
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        MEDIA_PLAYER_DOMAIN,
+        SERVICE_PLAY_MEDIA,
+        {
+            ATTR_ENTITY_ID: ENTITY_ID,
+            ATTR_MEDIA_CONTENT_TYPE: MediaType.MUSIC,
+            ATTR_MEDIA_CONTENT_ID: MEDIA_ID,
+            ATTR_MEDIA_ENQUEUE: MediaPlayerEnqueue.ADD,
+        },
+        blocking=True,
+    )
+
+    mock_device.play_media.assert_awaited_once_with(
+        {"title": "Home Assistant", "uri": MEDIA_ID}
+    )
+    assert not mock_device.playlist_actions
+
+
+async def test_play_media_enqueue_error_is_raised(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a rejected Playlist service action raises HomeAssistantError."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": "Playlist",
+        "type": "Playlist",
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    delete_all = mock_device.playlist_service.action("DeleteAll")
+    delete_all.async_call.side_effect = UpnpError("SOAP fault")
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: ENTITY_ID,
+                ATTR_MEDIA_CONTENT_TYPE: MediaType.MUSIC,
+                ATTR_MEDIA_CONTENT_ID: MEDIA_ID,
+                ATTR_MEDIA_ENQUEUE: MediaPlayerEnqueue.REPLACE,
+            },
+            blocking=True,
+        )
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == SERVICE_PLAY_MEDIA
+    delete_all.async_call.assert_awaited_once_with()
+
+
+async def test_play_media_timeout_is_raised(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a raw TimeoutError from the device raises a translated HomeAssistantError."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": "Playlist",
+        "type": "Playlist",
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    id_array = mock_device.playlist_service.action("IdArray")
+    id_array.async_call.side_effect = TimeoutError("[Errno 110] Connection timed out")
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: ENTITY_ID,
+                ATTR_MEDIA_CONTENT_TYPE: MediaType.MUSIC,
+                ATTR_MEDIA_CONTENT_ID: MEDIA_ID,
+            },
+            blocking=True,
+        )
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == SERVICE_PLAY_MEDIA
+
+
+async def test_play_media_media_source_keeps_media_metadata(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a media library item is enqueued with its own title and artwork."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": "Playlist",
+        "type": "Playlist",
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    browsed = MagicMock(
+        title="Track Title", thumbnail="http://localhost/art.jpg", can_expand=False
+    )
+    with (
+        patch(
+            "homeassistant.components.media_source.async_browse_media",
+            AsyncMock(return_value=browsed),
+        ),
+        patch(
+            "homeassistant.components.media_source.async_resolve_media",
+            AsyncMock(
+                return_value=PlayMedia(
+                    "http://localhost/media/track.flac", "audio/flac"
+                )
+            ),
+        ),
+    ):
+        await hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: ENTITY_ID,
+                ATTR_MEDIA_CONTENT_TYPE: MediaType.MUSIC,
+                ATTR_MEDIA_CONTENT_ID: "media-source://media_source/music/track.flac",
+            },
+            blocking=True,
+        )
+
+    expected_metadata = didl_lite.generate_string(
+        {
+            "title": "Track Title",
+            "uri": "http://localhost/media/track.flac",
+            "albumArtwork": "http://localhost/art.jpg",
+        }
+    )
+    mock_device.playlist_actions["Insert"].async_call.assert_awaited_once_with(
+        AfterId=3, Uri="http://localhost/media/track.flac", Metadata=expected_metadata
+    )
+    mock_device.play_media.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("source_type", "expected_set_source_calls"),
+    [
+        pytest.param("Playlist", 1, id="switches_to_radio_source"),
+        pytest.param("Radio", 0, id="already_on_radio_source"),
+    ],
+)
+async def test_play_media_radio_browser_uses_radio_service(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+    source_type: str,
+    expected_set_source_calls: int,
+) -> None:
+    """Test a radio browser station is played through the Openhome Radio service."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": source_type,
+        "type": source_type,
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    track_details = {
+        "title": "My Radio",
+        "uri": "http://stream.example/radio",
+        "albumArtwork": "http://localhost/favicon.ico",
+    }
+    browsed = MagicMock(
+        title="My Radio",
+        thumbnail="http://localhost/favicon.ico",
+        can_expand=False,
+    )
+    with (
+        patch(
+            "homeassistant.components.media_source.async_browse_media",
+            AsyncMock(return_value=browsed),
+        ),
+        patch(
+            "homeassistant.components.media_source.async_resolve_media",
+            AsyncMock(
+                return_value=PlayMedia("http://stream.example/radio", "audio/mpeg")
+            ),
+        ),
+    ):
+        await hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: ENTITY_ID,
+                ATTR_MEDIA_CONTENT_TYPE: "audio/mpeg",
+                ATTR_MEDIA_CONTENT_ID: "media-source://radio_browser/station-uuid",
+            },
+            blocking=True,
+        )
+
+    assert mock_device.set_source.await_count == expected_set_source_calls
+    if expected_set_source_calls:
+        mock_device.set_source.assert_awaited_once_with(1)
+    radio = mock_device.radio_actions
+    assert set(radio) == {"SetChannel", "Stop", "Play"}
+    radio["SetChannel"].async_call.assert_awaited_once_with(
+        Uri=track_details["uri"],
+        Metadata=didl_lite.generate_string(track_details),
+    )
+    radio["Stop"].async_call.assert_awaited_once_with()
+    radio["Play"].async_call.assert_awaited_once_with()
+    mock_device.play_media.assert_not_awaited()
+    assert not mock_device.playlist_actions
+
+
+async def test_play_media_radio_station_found_in_source_listing(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a station browsed as a listing gets its name and icon in the metadata."""
+    await setup_media_player(hass, mock_config_entry)
+
+    station_id = "media-source://radio_browser/station-uuid"
+    station = MagicMock(
+        media_content_id=station_id,
+        title="France Inter",
+        thumbnail="http://localhost/france-inter.ico",
+        can_play=True,
+        can_expand=False,
+    )
+    category = MagicMock(
+        media_content_id="media-source://radio_browser/popular", can_expand=True
+    )
+    category_listing = MagicMock(can_expand=True, children=[station])
+    root_listing = MagicMock(can_expand=True, children=[category])
+
+    async def browse_side_effect(
+        hass: HomeAssistant, media_content_id: str, **kwargs: Any
+    ) -> MagicMock:
+        if media_content_id == category.media_content_id:
+            return category_listing
+        if media_content_id == station_id:
+            # radio_browser returns an empty listing for a station id
+            return MagicMock(can_expand=True, children=[])
+        return root_listing
+
+    with (
+        patch(
+            "homeassistant.components.media_source.async_browse_media",
+            AsyncMock(side_effect=browse_side_effect),
+        ),
+        patch(
+            "homeassistant.components.media_source.async_resolve_media",
+            AsyncMock(
+                return_value=PlayMedia(
+                    "http://stream.example/france-inter", "audio/mpeg"
+                )
+            ),
+        ),
+    ):
+        await hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: ENTITY_ID,
+                ATTR_MEDIA_CONTENT_TYPE: "audio/mpeg",
+                ATTR_MEDIA_CONTENT_ID: station_id,
+            },
+            blocking=True,
+        )
+
+    track_details = {
+        "title": "France Inter",
+        "uri": "http://stream.example/france-inter",
+        "albumArtwork": "http://localhost/france-inter.ico",
+    }
+    radio = mock_device.radio_actions
+    assert set(radio) == {"SetChannel", "Stop", "Play"}
+    radio["SetChannel"].async_call.assert_awaited_once_with(
+        Uri=track_details["uri"],
+        Metadata=didl_lite.generate_string(track_details),
+    )
+    mock_device.play_media.assert_not_awaited()
+    assert not mock_device.playlist_actions
+
+
+async def test_play_media_raw_stream_uses_radio_service(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a raw audio stream URL is played through the Openhome Radio service."""
+    await setup_media_player(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        MEDIA_PLAYER_DOMAIN,
+        SERVICE_PLAY_MEDIA,
+        {
+            ATTR_ENTITY_ID: ENTITY_ID,
+            ATTR_MEDIA_CONTENT_TYPE: "audio/mpeg",
+            ATTR_MEDIA_CONTENT_ID: "http://stream.example/radio",
+        },
+        blocking=True,
+    )
+
+    track_details = {"title": "Home Assistant", "uri": "http://stream.example/radio"}
+    radio = mock_device.radio_actions
+    assert set(radio) == {"SetChannel", "Stop", "Play"}
+    radio["SetChannel"].async_call.assert_awaited_once_with(
+        Uri=track_details["uri"],
+        Metadata=didl_lite.generate_string(track_details),
+    )
+    mock_device.play_media.assert_not_awaited()
+    assert not mock_device.playlist_actions
+
+
+async def test_play_media_without_enqueue_appends_to_playlist(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test play_media without an explicit enqueue appends and plays on the playlist."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": "Playlist",
+        "type": "Playlist",
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        MEDIA_PLAYER_DOMAIN,
+        SERVICE_PLAY_MEDIA,
+        {
+            ATTR_ENTITY_ID: ENTITY_ID,
+            ATTR_MEDIA_CONTENT_TYPE: MediaType.MUSIC,
+            ATTR_MEDIA_CONTENT_ID: MEDIA_ID,
+        },
+        blocking=True,
+    )
+
+    actions = mock_device.playlist_actions
+    assert set(actions) == {"IdArray", "Insert", "SeekId"}
+    actions["Insert"].async_call.assert_awaited_once_with(
+        AfterId=3, Uri=MEDIA_ID, Metadata=TRACK_METADATA
+    )
+    actions["SeekId"].async_call.assert_awaited_once_with(Value=4)
+    mock_device.play_media.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("media_content_id", "media_content_type", "expected_calls"),
+    [
+        pytest.param(
+            PLAYLIST_MEDIA_CONTENT_ID,
+            MediaType.PLAYLIST,
+            {"Play": {}},
+            id="playlist",
+        ),
+        pytest.param(
+            f"{PLAYLIST_MEDIA_CONTENT_ID}/2",
+            MediaType.MUSIC,
+            {"SeekId": {"Value": 2}},
+            id="track",
+        ),
+    ],
+)
+async def test_play_media_playlist_reference(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+    media_content_id: str,
+    media_content_type: MediaType,
+    expected_calls: dict[str, dict[str, Any]],
+) -> None:
+    """Test playing a browsed playlist item plays the playlist or seeks to the track."""
+    await setup_media_player(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        MEDIA_PLAYER_DOMAIN,
+        SERVICE_PLAY_MEDIA,
+        {
+            ATTR_ENTITY_ID: ENTITY_ID,
+            ATTR_MEDIA_CONTENT_TYPE: media_content_type,
+            ATTR_MEDIA_CONTENT_ID: media_content_id,
+        },
+        blocking=True,
+    )
+
+    assert set(mock_device.playlist_actions) == set(expected_calls)
+    for name, kwargs in expected_calls.items():
+        mock_device.playlist_actions[name].async_call.assert_awaited_once_with(**kwargs)
+    mock_device.play_media.assert_not_awaited()
+
+
+async def test_browse_media_root_lists_device_playlist(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test the media browser root offers the device playlist."""
+    await async_setup_component(hass, "media_source", {})
+    await setup_media_player(hass, mock_config_entry)
+
+    player = hass.data[MEDIA_PLAYER_DOMAIN].get_entity(ENTITY_ID)
+    assert player is not None
+    result = await player.async_browse_media()
+
+    nodes = [
+        child
+        for child in result.children or []
+        if child.media_content_id == PLAYLIST_MEDIA_CONTENT_ID
+    ]
+    assert len(nodes) == 1
+    assert nodes[0].media_class == MediaClass.PLAYLIST
+    assert nodes[0].can_play
+    assert nodes[0].can_expand
+
+
+async def test_browse_media_playlist_lists_tracks(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test browsing the device playlist lists its tracks with their ids."""
+    await setup_media_player(hass, mock_config_entry)
+
+    player = hass.data[MEDIA_PLAYER_DOMAIN].get_entity(ENTITY_ID)
+    assert player is not None
+    result = await player.async_browse_media(None, PLAYLIST_MEDIA_CONTENT_ID)
+
+    assert result.media_content_id == PLAYLIST_MEDIA_CONTENT_ID
+    assert result.media_class == MediaClass.PLAYLIST
+    children = result.children or []
+    assert [child.media_content_id for child in children] == [
+        f"{PLAYLIST_MEDIA_CONTENT_ID}/{track_id}" for track_id in (1, 2, 3)
+    ]
+    assert [child.title for child in children] == ["Track 1", "Track 2", "Track 3"]
+    assert all(child.can_play and not child.can_expand for child in children)
+    mock_device.playlist_actions["ReadList"].async_call.assert_awaited_once_with(
+        IdList="1 2 3"
+    )
+
+
+async def test_browse_media_playlist_error_is_raised(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a rejected Playlist service action while browsing raises BrowseError."""
+    await setup_media_player(hass, mock_config_entry)
+
+    id_array = mock_device.playlist_service.action("IdArray")
+    id_array.async_call.side_effect = OpenhomeConnectionError("no route to host")
+
+    player = hass.data[MEDIA_PLAYER_DOMAIN].get_entity(ENTITY_ID)
+    assert player is not None
+    with pytest.raises(BrowseError) as err:
+        await player.async_browse_media(None, PLAYLIST_MEDIA_CONTENT_ID)
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "browse_playlist_failed"
+
+
+async def test_clear_playlist(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test clear_playlist empties the device playlist."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": "Playlist",
+        "type": "Playlist",
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        MEDIA_PLAYER_DOMAIN,
+        SERVICE_CLEAR_PLAYLIST,
+        {ATTR_ENTITY_ID: ENTITY_ID},
+        blocking=True,
+    )
+
+    mock_device.playlist_actions["DeleteAll"].async_call.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize(
+    ("data", "expected_ids"),
+    [
+        pytest.param({OpenhomeServiceArgument.TRACK_ID: 2}, [2], id="single_id"),
+        pytest.param(
+            {OpenhomeServiceArgument.TRACK_ID: [1, 3]}, [1, 3], id="multiple_ids"
+        ),
+        pytest.param(
+            {OpenhomeServiceArgument.URI: "http://localhost/track2.flac"},
+            [2],
+            id="uri",
+        ),
+        pytest.param(
+            {
+                OpenhomeServiceArgument.URI: [
+                    "http://localhost/track1.flac",
+                    "http://localhost/track3.flac",
+                ]
+            },
+            [1, 3],
+            id="multiple_uris",
+        ),
+        pytest.param(
+            {
+                OpenhomeServiceArgument.TRACK_ID: 1,
+                OpenhomeServiceArgument.URI: "http://localhost/track3.flac",
+            },
+            [1, 3],
+            id="id_and_uri",
+        ),
+    ],
+)
+async def test_remove_from_playlist(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+    data: dict[str, Any],
+    expected_ids: list[int],
+) -> None:
+    """Test remove_from_playlist deletes the tracks by id or uri."""
+    await setup_media_player(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        DOMAIN,
+        OpenhomeService.REMOVE_FROM_PLAYLIST,
+        {ATTR_ENTITY_ID: ENTITY_ID, **data},
+        blocking=True,
+    )
+
+    delete_id = mock_device.playlist_actions["DeleteId"]
+    delete_id.async_call.assert_has_awaits(
+        [call(Id=track_id) for track_id in expected_ids]
+    )
+    if OpenhomeServiceArgument.URI in data:
+        mock_device.playlist_actions["ReadList"].async_call.assert_awaited_once_with(
+            IdList="1 2 3"
+        )
+
+
+async def test_remove_from_playlist_requires_a_track(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test remove_from_playlist without a track id or uri is rejected."""
+    await setup_media_player(hass, mock_config_entry)
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            OpenhomeService.REMOVE_FROM_PLAYLIST,
+            {ATTR_ENTITY_ID: ENTITY_ID},
+            blocking=True,
+        )
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "remove_from_playlist_no_tracks"
+    assert "DeleteId" not in mock_device.playlist_actions
+
+
+async def test_remove_from_playlist_error_is_raised(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+) -> None:
+    """Test a rejected DeleteId raises HomeAssistantError."""
+    await setup_media_player(hass, mock_config_entry)
+
+    delete_id = mock_device.playlist_service.action("DeleteId")
+    delete_id.async_call.side_effect = UpnpError("SOAP fault")
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            DOMAIN,
+            OpenhomeService.REMOVE_FROM_PLAYLIST,
+            {ATTR_ENTITY_ID: ENTITY_ID, OpenhomeServiceArgument.TRACK_ID: 2},
+            blocking=True,
+        )
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == OpenhomeService.REMOVE_FROM_PLAYLIST
+    delete_id.async_call.assert_awaited_once_with(Id=2)
+
+
+@pytest.mark.parametrize(
+    ("source_type", "expect_enqueue"),
+    [
+        pytest.param("Playlist", True, id="playlist_source"),
+        pytest.param("Radio", False, id="radio_source"),
+    ],
+)
+async def test_media_enqueue_feature(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+    source_type: str,
+    expect_enqueue: bool,
+) -> None:
+    """Test MEDIA_ENQUEUE is only advertised for playlist sources."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": source_type,
+        "type": source_type,
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    features = hass.states.get(ENTITY_ID).attributes["supported_features"]
+    assert bool(features & MediaPlayerEntityFeature.MEDIA_ENQUEUE) is expect_enqueue
+
+
+@pytest.mark.parametrize(
+    ("source_type", "expect_clear"),
+    [
+        pytest.param("Playlist", True, id="playlist_source"),
+        pytest.param("Radio", False, id="radio_source"),
+    ],
+)
+async def test_clear_playlist_feature(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+    source_type: str,
+    expect_clear: bool,
+) -> None:
+    """Test CLEAR_PLAYLIST is only advertised for playlist sources."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": source_type,
+        "type": source_type,
+    }
+
+    await setup_media_player(hass, mock_config_entry)
+
+    features = hass.states.get(ENTITY_ID).attributes["supported_features"]
+    assert bool(features & MediaPlayerEntityFeature.CLEAR_PLAYLIST) is expect_clear
+
+
 async def test_invoke_pin_calls_device(
     hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_device: MagicMock
 ) -> None:
@@ -351,28 +1097,45 @@ async def test_media_player(
     await snapshot_platform(hass, entity_registry, snapshot, mock_config_entry.entry_id)
 
 
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        pytest.param(
+            OpenhomeConnectionError("device unreachable"),
+            "device unreachable",
+            id="openhome_error",
+        ),
+        pytest.param(
+            TimeoutError("[Errno 110] Connection timed out"),
+            "[Errno 110] Connection timed out",
+            id="timeout_error",
+        ),
+    ],
+)
 async def test_becomes_unavailable_and_recovers(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_device: MagicMock,
     caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    message: str,
 ) -> None:
     """Test a failed poll logs once, marks the device unavailable and recovers."""
     await setup_media_player(hass, mock_config_entry)
 
     assert hass.states.get(ENTITY_ID).state == STATE_PLAYING
 
-    mock_device.room.side_effect = OpenhomeConnectionError("device unreachable")
+    mock_device.room.side_effect = error
     await async_poll(hass)
 
     assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
-    assert caplog.text.count("device unreachable") == 1
+    assert caplog.text.count(message) == 1
 
     # A second consecutive failure must not log the same outage again.
     await async_poll(hass)
 
     assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
-    assert caplog.text.count("device unreachable") == 1
+    assert caplog.text.count(message) == 1
 
     mock_device.room.side_effect = None
     await async_poll(hass)

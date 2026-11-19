@@ -1,5 +1,11 @@
 {
   "exceptions": {
+    "browse_playlist_failed": {
+      "message": "Failed to browse the playlist of the device"
+    },
+    "clear_playlist": {
+      "message": "Failed to clear the playlist"
+    },
     "invoke_pin": {
       "message": "Failed to invoke the pin"
     },
@@ -23,6 +29,12 @@
     },
     "play_media": {
       "message": "Failed to play media"
+    },
+    "remove_from_playlist": {
+      "message": "Failed to remove tracks from the playlist"
+    },
+    "remove_from_playlist_no_tracks": {
+      "message": "Provide at least one track ID or URI"
     },
     "select_source": {
       "message": "Failed to select the source"
@@ -56,6 +68,20 @@
         }
       },
       "name": "Play pin"
+    },
+    "remove_from_playlist": {
+      "description": "Removes tracks from the playlist of the device. At least one track ID or URI must be provided.",
+      "fields": {
+        "track_id": {
+          "description": "ID of the playlist track to remove, as reported when browsing the device playlist.",
+          "name": "Track ID"
+        },
+        "uri": {
+          "description": "URI of the playlist track to remove. Resolved to its track ID in the device playlist.",
+          "name": "URI"
+        }
+      },
+      "name": "Remove from playlist"
     }
   }
 }

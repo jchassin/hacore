@@ -2,6 +2,9 @@
   "services": {
     "invoke_pin": {
       "service": "mdi:alarm-panel"
+    },
+    "remove_from_playlist": {
+      "service": "mdi:playlist-remove"
     }
   }
 }

@@ -12,3 +12,22 @@ invoke_pin:
         number:
           min: 0
           max: 1000
+
+remove_from_playlist:
+  target:
+    entity:
+      integration: openhome
+      domain: media_player
+  fields:
+    track_id:
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 4294967295
+          mode: box
+    uri:
+      required: false
+      selector:
+        text:
+          multiple: true

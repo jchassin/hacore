@@ -1,23 +1,34 @@
 """Support for Openhome Devices."""
 
+import base64
 from collections.abc import Awaitable, Callable, Coroutine
 import functools
 import logging
+import struct
 from typing import Any, Concatenate, override
 
+from async_upnp_client.exceptions import UpnpError
+import defusedxml.ElementTree as ET
+from openhomedevice import didl_lite
 from openhomedevice.exceptions import OpenhomeError
 
 from homeassistant.components import media_source
 from homeassistant.components.media_player import (
+    ATTR_MEDIA_ENQUEUE,
+    SERVICE_CLEAR_PLAYLIST,
     SERVICE_PLAY_MEDIA,
     SERVICE_SELECT_SOURCE,
+    BrowseError,
     BrowseMedia,
+    MediaClass,
+    MediaPlayerEnqueue,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
     MediaType,
     async_process_play_media_url,
 )
+from homeassistant.components.media_source import MediaSourceItem
 from homeassistant.const import (
     SERVICE_MEDIA_NEXT_TRACK,
     SERVICE_MEDIA_PAUSE,
@@ -32,7 +43,7 @@ from homeassistant.const import (
     SERVICE_VOLUME_UP,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -44,6 +55,10 @@ SUPPORT_OPENHOME = (
     | MediaPlayerEntityFeature.TURN_OFF
     | MediaPlayerEntityFeature.TURN_ON
 )
+
+# media_content_id of the device playlist node in the media browser; a track of
+# that playlist is addressed as f"{PLAYLIST_MEDIA_CONTENT_ID}/{track_id}".
+PLAYLIST_MEDIA_CONTENT_ID = "openhome://playlist"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -86,10 +101,10 @@ def catch_request_errors[_OpenhomeDeviceT: OpenhomeDevice, **_P, _R](
         async def wrapper(
             self: _OpenhomeDeviceT, *args: _P.args, **kwargs: _P.kwargs
         ) -> _R:
-            """Catch OpenhomeError errors."""
+            """Catch device errors, including raw network OSErrors."""
             try:
                 return await func(self, *args, **kwargs)
-            except OpenhomeError as err:
+            except (OpenhomeError, UpnpError, OSError) as err:
                 raise HomeAssistantError(
                     translation_domain=DOMAIN,
                     translation_key=action,
@@ -171,6 +186,8 @@ class OpenhomeDevice(MediaPlayerEntity):
                     | MediaPlayerEntityFeature.PLAY
                     | MediaPlayerEntityFeature.PLAY_MEDIA
                     | MediaPlayerEntityFeature.BROWSE_MEDIA
+                    | MediaPlayerEntityFeature.MEDIA_ENQUEUE
+                    | MediaPlayerEntityFeature.CLEAR_PLAYLIST
                 )
 
             in_standby = await self._device.is_in_standby()
@@ -188,7 +205,7 @@ class OpenhomeDevice(MediaPlayerEntity):
                 self._attr_state = MediaPlayerState.PLAYING
 
             self._attr_available = True
-        except OpenhomeError as err:
+        except (OpenhomeError, OSError) as err:
             if self._attr_available:
                 _LOGGER.warning("Error updating %s: %s", self.entity_id, err)
             self._attr_available = False
@@ -211,25 +228,203 @@ class OpenhomeDevice(MediaPlayerEntity):
         self, media_type: MediaType | str, media_id: str, **kwargs: Any
     ) -> None:
         """Send the play_media command to the media player."""
+        if media_id == PLAYLIST_MEDIA_CONTENT_ID or media_id.startswith(
+            f"{PLAYLIST_MEDIA_CONTENT_ID}/"
+        ):
+            await self._async_play_playlist_media(media_id)
+            return
+
+        # Radio streams carry their mime type as media_content_type; they are
+        # played through the Openhome Radio service, not added to the playlist.
+        is_radio = media_type.startswith("audio/")
+        track_details = {"title": "Home Assistant", "uri": media_id}
+
         if media_source.is_media_source_id(media_id):
+            source_item = MediaSourceItem.from_uri(self.hass, media_id, self.entity_id)
+            is_radio = source_item.domain == "radio_browser"
             media_type = MediaType.MUSIC
+            browsed = await self._async_browse_media_item(media_id)
             play_item = await media_source.async_resolve_media(
                 self.hass, media_id, self.entity_id
             )
             media_id = play_item.url
+            # Keep the media's own metadata instead of a generic one.
+            track_details = {
+                "title": "Home Assistant",
+                "uri": media_id,
+                "albumArtwork": "",
+            }
+            if browsed is not None:
+                track_details["title"] = browsed.title or "Home Assistant"
+                track_details["albumArtwork"] = browsed.thumbnail or ""
 
-        if media_type != MediaType.MUSIC:
+        if media_type != MediaType.MUSIC and not is_radio:
             _LOGGER.error(
-                "Invalid media type %s. Only %s is supported",
+                "Invalid media type %s. Only %s and audio streams are supported",
                 media_type,
                 MediaType.MUSIC,
             )
             return
 
         media_id = async_process_play_media_url(self.hass, media_id)
+        track_details["uri"] = media_id
 
-        track_details = {"title": "Home Assistant", "uri": media_id}
-        await self._device.play_media(track_details)
+        if is_radio:
+            await self._async_play_radio(track_details)
+            return
+
+        # Without an explicit enqueue, playing media appends it to the device
+        # playlist and plays it there instead of streaming it directly.
+        enqueue = kwargs.get(ATTR_MEDIA_ENQUEUE, MediaPlayerEnqueue.PLAY)
+
+        source = await self._device.source()
+        if source["type"] in ("Playlist", "Spotify"):
+            await self._async_play_on_playlist(track_details, enqueue)
+        else:
+            await self._device.play_media(track_details)
+
+    async def _async_playlist_action(self, name: str, **kwargs: Any) -> dict[str, Any]:
+        """Call an action on the device Playlist service."""
+        action = self._device.playlist_service.action(name)
+        return await action.async_call(**kwargs)
+
+    async def _async_playlist_ids(self) -> list[int]:
+        """Return the ids of the tracks in the device playlist."""
+        result = await self._async_playlist_action("IdArray")
+        data = base64.b64decode(result.get("Array", ""))
+        if not data:
+            return []
+        return list(struct.unpack(f">{len(data) // 4}I", data))
+
+    async def _async_last_track_id(self) -> int:
+        """Return the id of the last track in the playlist, 0 when empty."""
+        ids = await self._async_playlist_ids()
+        return ids[-1] if ids else 0
+
+    async def _async_playlist_tracks(self, ids: list[int]) -> dict[int, dict[str, Any]]:
+        """Return the uri and metadata of the given playlist tracks, by id."""
+        if not ids:
+            return {}
+        result = await self._async_playlist_action(
+            "ReadList", IdList=" ".join(str(track_id) for track_id in ids)
+        )
+        track_list = result.get("TrackList", "")
+        if not track_list:
+            return {}
+        tracks: dict[int, dict[str, Any]] = {}
+        for entry in ET.fromstring(track_list).findall("Entry"):
+            track_id = int(entry.findtext("Id", "0"))
+            details = didl_lite.parse(entry.findtext("Metadata"))
+            details["uri"] = entry.findtext("Uri") or details.get("uri", "")
+            tracks[track_id] = details
+        return tracks
+
+    async def _async_play_playlist_media(self, media_content_id: str) -> None:
+        """Play the device playlist itself or one of its tracks."""
+        if media_content_id == PLAYLIST_MEDIA_CONTENT_ID:
+            await self._async_playlist_action("Play")
+            return
+        track_id = media_content_id.removeprefix(f"{PLAYLIST_MEDIA_CONTENT_ID}/")
+        await self._async_playlist_action("SeekId", Value=int(track_id))
+
+    async def _async_radio_action(self, name: str, **kwargs: Any) -> dict[str, Any]:
+        """Call an action on the device Radio service."""
+        action = self._device.radio_service.action(name)
+        return await action.async_call(**kwargs)
+
+    async def _async_play_radio(self, track_details: dict[str, str]) -> None:
+        """Play a radio stream through the Openhome Radio service."""
+        # Activate the Radio source first. Radio Play switches to it, but on
+        # some renderers a Play arriving while the source switch buffers the
+        # stream is ignored, leaving the device stuck in Buffering; the Stop
+        # clears that state and the following Play starts the channel.
+        source = await self._device.source()
+        if source["type"] != "Radio":
+            for radio_source in await self._device.sources():
+                if radio_source["type"] == "Radio":
+                    await self._device.set_source(radio_source["index"])
+                    break
+        await self._async_radio_action(
+            "SetChannel",
+            Uri=track_details["uri"],
+            Metadata=didl_lite.generate_string(track_details),
+        )
+        await self._async_radio_action("Stop")
+        await self._async_radio_action("Play")
+
+    async def _async_browse_media_item(
+        self, media_content_id: str
+    ) -> BrowseMedia | None:
+        """Return the browse item for a media_content_id.
+
+        Browsing a leaf id can return a listing instead of the item (e.g.
+        radio_browser returns an empty listing for a station id), so fall back
+        to searching the media source root.
+        """
+        item = await media_source.async_browse_media(self.hass, media_content_id)
+        if not item.can_expand:
+            return item
+        parsed = MediaSourceItem.from_uri(self.hass, media_content_id, None)
+        if parsed.domain is None:
+            return None
+        root = await media_source.async_browse_media(
+            self.hass, f"{media_source.URI_SCHEME}{parsed.domain}"
+        )
+        return await self._async_search_media_tree(root, media_content_id, depth=0)
+
+    async def _async_search_media_tree(
+        self, item: BrowseMedia, media_content_id: str, *, depth: int
+    ) -> BrowseMedia | None:
+        """Search the children of an expandable browse item for a media_content_id."""
+        if depth > 2:
+            return None
+        for child in item.children or []:
+            if child.media_content_id == media_content_id:
+                return child
+            if child.can_expand:
+                sub_item = await media_source.async_browse_media(
+                    self.hass, child.media_content_id
+                )
+                found = await self._async_search_media_tree(
+                    sub_item, media_content_id, depth=depth + 1
+                )
+                if found is not None:
+                    return found
+        return None
+
+    async def _async_insert_track(
+        self, track_details: dict[str, str], after_id: int
+    ) -> int:
+        """Insert a track in the playlist after after_id, returning its new id."""
+        result = await self._async_playlist_action(
+            "Insert",
+            AfterId=after_id,
+            Uri=track_details["uri"],
+            Metadata=didl_lite.generate_string(track_details),
+        )
+        return int(result["NewId"])
+
+    async def _async_play_on_playlist(
+        self, track_details: dict[str, str], enqueue: MediaPlayerEnqueue
+    ) -> None:
+        """Add the track to the device playlist according to the enqueue mode."""
+        if enqueue == MediaPlayerEnqueue.ADD:
+            await self._async_insert_track(
+                track_details, await self._async_last_track_id()
+            )
+        elif enqueue == MediaPlayerEnqueue.NEXT:
+            current_id = (await self._async_playlist_action("Id"))["Value"]
+            new_id = await self._async_insert_track(track_details, current_id)
+            await self._async_playlist_action("SeekId", Value=new_id)
+        elif enqueue == MediaPlayerEnqueue.PLAY:
+            new_id = await self._async_insert_track(
+                track_details, await self._async_last_track_id()
+            )
+            await self._async_playlist_action("SeekId", Value=new_id)
+        else:
+            await self._async_playlist_action("DeleteAll")
+            new_id = await self._async_insert_track(track_details, 0)
+            await self._async_playlist_action("SeekId", Value=new_id)
 
     @catch_request_errors(SERVICE_MEDIA_PAUSE)
     @override
@@ -266,6 +461,36 @@ class OpenhomeDevice(MediaPlayerEntity):
     async def async_select_source(self, source: str) -> None:
         """Select input source."""
         await self._device.set_source(self._source_index[source])
+
+    @catch_request_errors(SERVICE_CLEAR_PLAYLIST)
+    @override
+    async def async_clear_playlist(self) -> None:
+        """Clear the device playlist."""
+        await self._async_playlist_action("DeleteAll")
+
+    @catch_request_errors(OpenhomeService.REMOVE_FROM_PLAYLIST)
+    async def async_remove_from_playlist(
+        self,
+        track_id: int | list[int] | None = None,
+        uri: str | list[str] | None = None,
+    ) -> None:
+        """Remove tracks from the device playlist by id or uri."""
+        if track_id is None and uri is None:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="remove_from_playlist_no_tracks",
+            )
+        ids = {track_id} if isinstance(track_id, int) else set(track_id or ())
+        if uri:
+            wanted = {uri} if isinstance(uri, str) else set(uri)
+            tracks = await self._async_playlist_tracks(await self._async_playlist_ids())
+            ids.update(
+                track
+                for track, details in tracks.items()
+                if details.get("uri") in wanted
+            )
+        for track in sorted(ids):
+            await self._async_playlist_action("DeleteId", Id=track)
 
     @catch_request_errors(OpenhomeService.INVOKE_PIN)
     async def async_invoke_pin(self, pin):
@@ -308,8 +533,58 @@ class OpenhomeDevice(MediaPlayerEntity):
         media_content_id: str | None = None,
     ) -> BrowseMedia:
         """Implement the websocket media browsing helper."""
-        return await media_source.async_browse_media(
+        if media_content_id is not None and (
+            media_content_id == PLAYLIST_MEDIA_CONTENT_ID
+            or media_content_id.startswith(f"{PLAYLIST_MEDIA_CONTENT_ID}/")
+        ):
+            return await self._async_browse_playlist()
+        browse = await media_source.async_browse_media(
             self.hass,
             media_content_id,
             content_filter=lambda item: item.media_content_type.startswith("audio/"),
+        )
+        if media_content_id is None:
+            browse.children = [
+                *(browse.children or []),
+                BrowseMedia(
+                    title="Device playlist",
+                    media_class=MediaClass.PLAYLIST,
+                    media_content_id=PLAYLIST_MEDIA_CONTENT_ID,
+                    media_content_type=MediaType.PLAYLIST,
+                    can_play=True,
+                    can_expand=True,
+                ),
+            ]
+        return browse
+
+    async def _async_browse_playlist(self) -> BrowseMedia:
+        """Browse the tracks of the device playlist."""
+        try:
+            ids = await self._async_playlist_ids()
+            tracks = await self._async_playlist_tracks(ids)
+        except (OpenhomeError, UpnpError, OSError) as err:
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="browse_playlist_failed",
+            ) from err
+        return BrowseMedia(
+            title="Device playlist",
+            media_class=MediaClass.PLAYLIST,
+            media_content_id=PLAYLIST_MEDIA_CONTENT_ID,
+            media_content_type=MediaType.PLAYLIST,
+            can_play=True,
+            can_expand=True,
+            children=[
+                BrowseMedia(
+                    title=tracks.get(track_id, {}).get("title") or f"Track {track_id}",
+                    media_class=MediaClass.TRACK,
+                    media_content_id=f"{PLAYLIST_MEDIA_CONTENT_ID}/{track_id}",
+                    media_content_type=MediaType.MUSIC,
+                    can_play=True,
+                    can_expand=False,
+                    thumbnail=tracks.get(track_id, {}).get("albumArtwork"),
+                )
+                for track_id in ids
+            ],
+            children_media_class=MediaClass.TRACK,
         )
