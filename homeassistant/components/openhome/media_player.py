@@ -270,7 +270,7 @@ class OpenhomeDevice(MediaPlayerEntity):
         track_details["uri"] = media_id
 
         if is_radio:
-            await self._device.play_media(track_details)
+            await self._async_play_radio(track_details)
             return
 
         # Without an explicit enqueue, playing media appends it to the device
@@ -326,6 +326,31 @@ class OpenhomeDevice(MediaPlayerEntity):
             return
         track_id = media_content_id.removeprefix(f"{PLAYLIST_MEDIA_CONTENT_ID}/")
         await self._async_playlist_action("SeekId", Value=int(track_id))
+
+    async def _async_radio_action(self, name: str, **kwargs: Any) -> dict[str, Any]:
+        """Call an action on the device Radio service."""
+        action = self._device.radio_service.action(name)
+        return await action.async_call(**kwargs)
+
+    async def _async_play_radio(self, track_details: dict[str, str]) -> None:
+        """Play a radio stream through the Openhome Radio service."""
+        # Activate the Radio source first. Radio Play switches to it, but on
+        # some renderers a Play arriving while the source switch buffers the
+        # stream is ignored, leaving the device stuck in Buffering; the Stop
+        # clears that state and the following Play starts the channel.
+        source = await self._device.source()
+        if source["type"] != "Radio":
+            for radio_source in await self._device.sources():
+                if radio_source["type"] == "Radio":
+                    await self._device.set_source(radio_source["index"])
+                    break
+        await self._async_radio_action(
+            "SetChannel",
+            Uri=track_details["uri"],
+            Metadata=didl_lite.generate_string(track_details),
+        )
+        await self._async_radio_action("Stop")
+        await self._async_radio_action("Play")
 
     async def _async_browse_media_item(
         self, media_content_id: str

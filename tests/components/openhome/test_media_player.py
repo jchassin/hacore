@@ -526,14 +526,34 @@ async def test_play_media_media_source_keeps_media_metadata(
     mock_device.play_media.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("source_type", "expected_set_source_calls"),
+    [
+        pytest.param("Playlist", 1, id="switches_to_radio_source"),
+        pytest.param("Radio", 0, id="already_on_radio_source"),
+    ],
+)
 async def test_play_media_radio_browser_uses_radio_service(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_device: MagicMock,
+    source_type: str,
+    expected_set_source_calls: int,
 ) -> None:
     """Test a radio browser station is played through the Openhome Radio service."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": source_type,
+        "type": source_type,
+    }
+
     await setup_media_player(hass, mock_config_entry)
 
+    track_details = {
+        "title": "My Radio",
+        "uri": "http://stream.example/radio",
+        "albumArtwork": "http://localhost/favicon.ico",
+    }
     browsed = MagicMock(
         title="My Radio",
         thumbnail="http://localhost/favicon.ico",
@@ -562,13 +582,18 @@ async def test_play_media_radio_browser_uses_radio_service(
             blocking=True,
         )
 
-    mock_device.play_media.assert_awaited_once_with(
-        {
-            "title": "My Radio",
-            "uri": "http://stream.example/radio",
-            "albumArtwork": "http://localhost/favicon.ico",
-        }
+    assert mock_device.set_source.await_count == expected_set_source_calls
+    if expected_set_source_calls:
+        mock_device.set_source.assert_awaited_once_with(1)
+    radio = mock_device.radio_actions
+    assert set(radio) == {"SetChannel", "Stop", "Play"}
+    radio["SetChannel"].async_call.assert_awaited_once_with(
+        Uri=track_details["uri"],
+        Metadata=didl_lite.generate_string(track_details),
     )
+    radio["Stop"].async_call.assert_awaited_once_with()
+    radio["Play"].async_call.assert_awaited_once_with()
+    mock_device.play_media.assert_not_awaited()
     assert not mock_device.playlist_actions
 
 
@@ -629,13 +654,18 @@ async def test_play_media_radio_station_found_in_source_listing(
             blocking=True,
         )
 
-    mock_device.play_media.assert_awaited_once_with(
-        {
-            "title": "France Inter",
-            "uri": "http://stream.example/france-inter",
-            "albumArtwork": "http://localhost/france-inter.ico",
-        }
+    track_details = {
+        "title": "France Inter",
+        "uri": "http://stream.example/france-inter",
+        "albumArtwork": "http://localhost/france-inter.ico",
+    }
+    radio = mock_device.radio_actions
+    assert set(radio) == {"SetChannel", "Stop", "Play"}
+    radio["SetChannel"].async_call.assert_awaited_once_with(
+        Uri=track_details["uri"],
+        Metadata=didl_lite.generate_string(track_details),
     )
+    mock_device.play_media.assert_not_awaited()
     assert not mock_device.playlist_actions
 
 
@@ -658,9 +688,14 @@ async def test_play_media_raw_stream_uses_radio_service(
         blocking=True,
     )
 
-    mock_device.play_media.assert_awaited_once_with(
-        {"title": "Home Assistant", "uri": "http://stream.example/radio"}
+    track_details = {"title": "Home Assistant", "uri": "http://stream.example/radio"}
+    radio = mock_device.radio_actions
+    assert set(radio) == {"SetChannel", "Stop", "Play"}
+    radio["SetChannel"].async_call.assert_awaited_once_with(
+        Uri=track_details["uri"],
+        Metadata=didl_lite.generate_string(track_details),
     )
+    mock_device.play_media.assert_not_awaited()
     assert not mock_device.playlist_actions
 
 

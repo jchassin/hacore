@@ -138,6 +138,19 @@ def mock_device_class() -> Generator[MagicMock]:
         device.playlist_service = MagicMock()
         device.playlist_service.action = MagicMock(side_effect=playlist_action)
         device.playlist_actions = playlist_actions
+        # Same for the Radio service actions used when playing a radio stream.
+        radio_actions: dict[str, MagicMock] = {}
+
+        def radio_action(name: str) -> MagicMock:
+            if name not in radio_actions:
+                action = MagicMock()
+                action.async_call = AsyncMock(return_value={})
+                radio_actions[name] = action
+            return radio_actions[name]
+
+        device.radio_service = MagicMock()
+        device.radio_service.action = MagicMock(side_effect=radio_action)
+        device.radio_actions = radio_actions
         yield mock_class
 
 
