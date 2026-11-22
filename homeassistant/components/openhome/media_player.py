@@ -11,6 +11,7 @@ from homeassistant.components import media_source
 from homeassistant.components.media_player import (
     SERVICE_PLAY_MEDIA,
     SERVICE_SELECT_SOURCE,
+    BrowseError,
     BrowseMedia,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
@@ -18,7 +19,7 @@ from homeassistant.components.media_player import (
     MediaType,
     async_process_play_media_url,
 )
-from homeassistant.components.media_source import MediaSourceItem
+from homeassistant.components.media_source import MediaSourceItem, Unresolvable
 from homeassistant.const import (
     SERVICE_MEDIA_NEXT_TRACK,
     SERVICE_MEDIA_PAUSE,
@@ -216,16 +217,30 @@ class OpenhomeDevice(MediaPlayerEntity):
 
         if media_source.is_media_source_id(media_id):
             media_type = MediaType.MUSIC
-            browsed = await self._async_browse_media_item(media_id)
+            media_content_id = media_id
             play_item = await media_source.async_resolve_media(
-                self.hass, media_id, self.entity_id
+                self.hass, media_content_id, self.entity_id
             )
             media_id = play_item.url
             track_details["uri"] = media_id
+            # Metadata lookup is best-effort: DLNA servers answer upnp error
+            # 710 when browsing the direct children of a file, which must not
+            # fail playback.
+            try:
+                browsed = await self._async_browse_media_item(media_content_id)
+            except (BrowseError, Unresolvable) as err:
+                _LOGGER.debug(
+                    "Could not browse %s for metadata: %s", media_content_id, err
+                )
+                browsed = None
             # Keep the media's own metadata instead of a generic one.
             if browsed is not None:
                 track_details["title"] = browsed.title or "Home Assistant"
                 track_details["albumArtwork"] = browsed.thumbnail or ""
+            elif didl := getattr(play_item, "didl_metadata", None):
+                track_details["title"] = didl.title or "Home Assistant"
+                if album_art := getattr(didl, "album_art_uri", None):
+                    track_details["albumArtwork"] = album_art
 
         if media_type != MediaType.MUSIC:
             _LOGGER.error(
