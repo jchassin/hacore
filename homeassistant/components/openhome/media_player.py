@@ -50,10 +50,6 @@ SUPPORT_OPENHOME = (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Cap on metadata browse requests during a source-tree search, so a large
-# media library cannot delay play_media with dozens of sequential requests.
-_MAX_METADATA_BROWSE_REQUESTS = 20
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -228,34 +224,21 @@ class OpenhomeDevice(MediaPlayerEntity):
             )
             media_id = play_item.url
             track_details["uri"] = media_id
-            didl = getattr(play_item, "didl_metadata", None)
-            # Skip metadata browsing when the resolved item already carries a
-            # title and artwork: extra browse requests only add latency to the
-            # playback path and can exhaust the search budget.
-            resolved_complete = bool(getattr(didl, "title", None)) and bool(
-                getattr(play_item, "thumbnail", None)
-                or getattr(didl, "album_art_uri", None)
-            )
             # Metadata lookup is best-effort: DLNA servers answer upnp error
             # 710 when browsing the direct children of a file, which must not
             # fail playback.
-            browsed = (
-                None
-                if resolved_complete
-                else await self._async_browse_media_item(media_content_id)
-            )
+            browsed = await self._async_browse_media_item(media_content_id)
             # Keep the media's own metadata instead of a generic one.
             if browsed is not None:
                 track_details["title"] = browsed.title or "Home Assistant"
                 track_details["albumArtwork"] = browsed.thumbnail or ""
-            elif didl is not None:
-                track_details["title"] = didl.title or "Home Assistant"
-                if thumbnail := getattr(play_item, "thumbnail", None):
-                    # Normalized to an absolute URL by the media source.
-                    track_details["albumArtwork"] = thumbnail
-                elif album_art := getattr(didl, "album_art_uri", None):
-                    # DIDL artwork URLs can be relative to the media server.
-                    track_details["albumArtwork"] = urljoin(media_id, album_art)
+            else:
+                didl = getattr(play_item, "didl_metadata", None)
+                if didl is not None:
+                    track_details["title"] = didl.title or "Home Assistant"
+                    if album_art := getattr(didl, "album_art_uri", None):
+                        # DIDL artwork URLs can be relative to the media server.
+                        track_details["albumArtwork"] = urljoin(media_id, album_art)
 
         if media_type != MediaType.MUSIC:
             _LOGGER.error(
@@ -276,33 +259,19 @@ class OpenhomeDevice(MediaPlayerEntity):
         """Return the browse item for a media_content_id.
 
         Browsing a leaf id can return a listing instead of the item (e.g.
-        radio_browser returns an empty listing for a station id), so fall back
-        to searching the media source root. When browsing the id itself fails
-        (e.g. upnp error 710 on a file), look the item up in its parent listing.
+        radio_browser returns an empty listing for a station id), in which
+        case there is no item metadata to use. When browsing the id itself
+        fails (e.g. upnp error 710 on a file), look the item up in its parent
+        listing.
         """
         try:
             item = await media_source.async_browse_media(self.hass, media_content_id)
         except (BrowseError, Unresolvable) as err:
             _LOGGER.debug("Could not browse %s for metadata: %s", media_content_id, err)
             return await self._async_find_in_parent_listing(media_content_id)
-        if not item.can_expand:
-            return item
-        parsed = MediaSourceItem.from_uri(self.hass, media_content_id, None)
-        if parsed.domain is None:
+        if item.can_expand:
             return None
-        try:
-            root = await media_source.async_browse_media(
-                self.hass, f"{media_source.URI_SCHEME}{parsed.domain}"
-            )
-        except (BrowseError, Unresolvable) as err:
-            _LOGGER.debug(
-                "Could not browse media source root of %s: %s", media_content_id, err
-            )
-            return None
-        budget = [_MAX_METADATA_BROWSE_REQUESTS]
-        return await self._async_search_media_tree(
-            root, media_content_id, depth=0, budget=budget
-        )
+        return item
 
     async def _async_find_in_parent_listing(
         self, media_content_id: str
@@ -326,40 +295,6 @@ class OpenhomeDevice(MediaPlayerEntity):
         for child in parent.children or []:
             if child.media_content_id == media_content_id:
                 return child
-        return None
-
-    async def _async_search_media_tree(
-        self,
-        item: BrowseMedia,
-        media_content_id: str,
-        *,
-        depth: int,
-        budget: list[int],
-    ) -> BrowseMedia | None:
-        """Search the children of an expandable browse item for a media_content_id."""
-        if depth > 2:
-            return None
-        for child in item.children or []:
-            if child.media_content_id == media_content_id:
-                return child
-            if child.can_expand and budget[0] > 0:
-                budget[0] -= 1
-                try:
-                    sub_item = await media_source.async_browse_media(
-                        self.hass, child.media_content_id
-                    )
-                except (BrowseError, Unresolvable) as err:
-                    _LOGGER.debug(
-                        "Could not browse %s during metadata search: %s",
-                        child.media_content_id,
-                        err,
-                    )
-                    continue
-                found = await self._async_search_media_tree(
-                    sub_item, media_content_id, depth=depth + 1, budget=budget
-                )
-                if found is not None:
-                    return found
         return None
 
     @catch_request_errors(SERVICE_MEDIA_PAUSE)
